@@ -1,0 +1,503 @@
+import { ollamaChat } from '@/lib/ollama'
+import { retrieveRelevantChunks, formatChunksAsContext } from '@/lib/rag/retriever'
+import { getTeamMemories, formatMemoriesAsContext } from '@/lib/agents/memory'
+import { applyRoutingRules } from '@/lib/agents/router'
+import { retrieveWithFallback, formatRetrievalResult } from '@/lib/rag/retrievalWithFallback'
+
+
+function buildAgentPrompt(agent, question, context, memoryContext, previousOutputs = []) {
+  const systemPrompt = agent.system_prompt?.slice(0, 300) ?? ''
+
+  let prompt = `${systemPrompt}\n\n`
+
+  if (memoryContext) {
+    prompt += `${memoryContext}\n\n`
+  }
+
+  // Check if context indicates empty retrieval
+  const isEmptyContext = context?.startsWith('⚠️ No relevant information') ||
+    context?.startsWith('No knowledge base') ||
+    context?.startsWith('Knowledge base retrieval')
+
+  if (isEmptyContext) {
+    prompt += `## Knowledge Base Status\n${context}\n\n`
+    prompt += `## Important Instructions
+Since no relevant documents were found in the knowledge base:
+- DO NOT hallucinate or make up information
+- Clearly state that the knowledge base does not contain information about this topic
+- If you have general knowledge about the topic, share it but CLEARLY label it as general knowledge not from the documents
+- Suggest what types of documents the user should upload to answer this question\n\n`
+  } else {
+    prompt += `## Knowledge Base Context\n${context}\n\n`
+  }
+
+  if (previousOutputs.length > 0) {
+    const lastOutput = previousOutputs[previousOutputs.length - 1]
+    prompt += `## Previous Analysis (${lastOutput.agentName})\n${lastOutput.output?.slice(0, 500)}\n\n`
+  }
+
+  prompt += `## Question\n${question}\n\nYour response:`
+
+  return prompt
+}
+
+function buildSynthesisPrompt(question, agentOutputs, context, memoryContext) {
+  let prompt = `You are the final synthesizer. Combine insights from multiple specialized agents into one clear, well-structured answer.
+
+IMPORTANT: You MUST cite your sources. When you use information from the context, add a citation like [Source 1], [Source 2], etc. matching the source numbers in the context below.
+
+`
+
+  if (memoryContext) {
+    prompt += `${memoryContext}\n\n`
+  }
+
+  prompt += `## Original Question\n${question}\n\n`
+  prompt += `## Knowledge Base Context (CITE THESE)\n${context}\n\n`
+  prompt += `## Agent Analyses\n`
+
+  agentOutputs.forEach(output => {
+    prompt += `### ${output.agentName} (${output.role}) using ${output.modelId}:\n${output.output}\n\n`
+  })
+
+  prompt += `## Final Synthesized Answer
+Write a comprehensive answer. After each claim from the documents, add [Source N] citation.
+End with a "## Sources" section listing each source you cited with its filename.
+
+Format:
+[Your answer with inline citations like [Source 1], [Source 2]]
+
+## Sources
+- [Source 1]: filename.pdf — brief description of what this source says
+- [Source 2]: filename.pdf — brief description`
+
+  return prompt
+}
+
+async function scoreAnswer(question, answer, context, modelId) {
+  const prompt = `You are a quality evaluator. Score this research answer.
+
+Question: ${question}
+Answer: ${answer}
+Context available: ${context.slice(0, 300)}...
+
+Respond ONLY with JSON (no markdown):
+{"quality": 8, "citation_accuracy": 7, "insight_depth": 8}
+
+Scores 1-10.`
+
+  try {
+    const response = await ollamaChat(modelId, [
+      { role: 'user', content: prompt }
+    ], { temperature: 0.1 })
+
+    const cleaned = response.replace(/```json|```/g, '').trim()
+    const scores = JSON.parse(cleaned)
+    return {
+      quality: Math.min(10, Math.max(1, scores.quality ?? 7)),
+      citation_accuracy: Math.min(10, Math.max(1, scores.citation_accuracy ?? 7)),
+      insight_depth: Math.min(10, Math.max(1, scores.insight_depth ?? 7)),
+    }
+  } catch {
+    return { quality: 7, citation_accuracy: 7, insight_depth: 7 }
+  }
+}
+
+async function runAgentWithRouting(agent, prompt, question) {
+  // Apply routing rules if configured
+  const routingRules = agent.routing_rules ?? []
+  const routing = applyRoutingRules(routingRules, question, agent.model_id)
+
+  const modelToUse = routing.modelId
+  const temperature = routing.temperature ?? agent.temperature ?? 0.7
+  const maxTokens = routing.maxTokens ?? agent.max_tokens ?? 2048
+
+  const output = await ollamaChat(modelToUse, [
+    { role: 'user', content: prompt }
+  ], { temperature, num_ctx: maxTokens })
+
+  return { output, modelUsed: modelToUse, routingInfo: routing }
+}
+
+async function runSequential(agents, question, context, memoryContext, onTraceUpdate) {
+  const traces = []
+  const previousOutputs = []
+
+  for (let i = 0; i < agents.length; i++) {
+    const agent = agents[i]
+    const startTime = Date.now()
+
+    onTraceUpdate({
+      agentName: agent.name,
+      role: agent.role,
+      modelId: agent.model_id,
+      status: 'running',
+      stepIndex: i,
+    })
+
+    const prompt = buildAgentPrompt(agent, question, context, memoryContext, previousOutputs)
+
+    try {
+      const { output, modelUsed, routingInfo } = await runAgentWithRouting(agent, prompt, question)
+
+      const trace = {
+        agentName: agent.name,
+        agentId: agent.id,
+        role: agent.role,
+        modelId: modelUsed,
+        originalModelId: agent.model_id,
+        routingInfo,
+        output,
+        processingTime: Date.now() - startTime,
+        stepIndex: i,
+        status: 'completed',
+      }
+
+      traces.push(trace)
+      previousOutputs.push(trace)
+      onTraceUpdate({ ...trace })
+    } catch (error) {
+      const trace = {
+        agentName: agent.name,
+        agentId: agent.id,
+        role: agent.role,
+        modelId: agent.model_id,
+        output: `Error: ${error.message}`,
+        processingTime: Date.now() - startTime,
+        stepIndex: i,
+        status: 'failed',
+      }
+      traces.push(trace)
+      onTraceUpdate({ ...trace })
+    }
+  }
+
+  return traces
+}
+
+async function runDebate(agents, question, context, memoryContext, debateConfig, onTraceUpdate) {
+  const traces = []
+  const protocol = debateConfig?.protocol ?? 'standard'
+  const rounds = debateConfig?.rounds ?? 2
+
+  for (let round = 1; round <= rounds; round++) {
+    const roundOutputs = await Promise.all(
+      agents.map(async (agent, i) => {
+        const startTime = Date.now()
+        const prevRoundOutputs = round > 1
+          ? traces.filter(t => t.round === round - 1 && t.agentName !== agent.name)
+          : []
+
+        onTraceUpdate({
+          agentName: agent.name,
+          role: agent.role,
+          modelId: agent.model_id,
+          status: 'running',
+          stepIndex: (round - 1) * agents.length + i,
+          round,
+        })
+
+        let roundPrompt = buildAgentPrompt(agent, question, context, memoryContext, prevRoundOutputs)
+
+        if (round > 1 && protocol === 'socratic') {
+          roundPrompt += `\n\nIn this round, respond to the other agents' points with probing questions that deepen the analysis.`
+        }
+
+        try {
+          const { output, modelUsed } = await runAgentWithRouting(agent, roundPrompt, question)
+
+          const trace = {
+            agentName: agent.name,
+            agentId: agent.id,
+            role: agent.role,
+            modelId: modelUsed,
+            output,
+            processingTime: Date.now() - startTime,
+            stepIndex: (round - 1) * agents.length + i,
+            status: 'completed',
+            round,
+          }
+
+          onTraceUpdate({ ...trace })
+          return trace
+        } catch (error) {
+          return {
+            agentName: agent.name,
+            agentId: agent.id,
+            role: agent.role,
+            modelId: agent.model_id,
+            output: `Error: ${error.message}`,
+            processingTime: Date.now() - startTime,
+            stepIndex: (round - 1) * agents.length + i,
+            status: 'failed',
+            round,
+          }
+        }
+      })
+    )
+
+    traces.push(...roundOutputs)
+  }
+
+  return traces
+}
+
+async function runParallel(agents, question, context, memoryContext, onTraceUpdate) {
+  // All agents run at the same time instead of one after another
+  const results = await Promise.all(
+    agents.map(async (agent, i) => {
+      const startTime = Date.now()
+
+      onTraceUpdate({
+        agentName: agent.name,
+        role: agent.role,
+        modelId: agent.model_id,
+        status: 'running',
+        stepIndex: i,
+      })
+
+      const prompt = buildAgentPrompt(agent, question, context, memoryContext, [])
+
+      try {
+        const { output, modelUsed } = await runAgentWithRouting(agent, prompt, question)
+        const trace = {
+          agentName: agent.name,
+          agentId: agent.id,
+          role: agent.role,
+          modelId: modelUsed,
+          output,
+          processingTime: Date.now() - startTime,
+          stepIndex: i,
+          status: 'completed',
+        }
+        onTraceUpdate({ ...trace })
+        return trace
+      } catch (error) {
+        const trace = {
+          agentName: agent.name,
+          agentId: agent.id,
+          role: agent.role,
+          modelId: agent.model_id,
+          output: `Error: ${error.message}`,
+          processingTime: Date.now() - startTime,
+          stepIndex: i,
+          status: 'failed',
+        }
+        onTraceUpdate({ ...trace })
+        return trace
+      }
+    })
+  )
+
+  return results
+}
+
+async function runHierarchical(agents, question, context, memoryContext, onTraceUpdate) {
+  if (agents.length < 2) return runSequential(agents, question, context, memoryContext, onTraceUpdate)
+
+  const [lead, ...subordinates] = agents
+  const traces = []
+
+  const planStartTime = Date.now()
+  onTraceUpdate({
+    agentName: lead.name,
+    role: lead.role,
+    modelId: lead.model_id,
+    status: 'running',
+    stepIndex: 0,
+  })
+
+  const planPrompt = `${lead.system_prompt}\n\n${memoryContext ?? ''}\n\nYou are the lead agent. Break this question into ${subordinates.length} subtask(s).\n\nQuestion: ${question}\n\nContext:\n${context}\n\nCreate a brief plan with ${subordinates.length} numbered subtasks:`
+
+  const plan = await ollamaChat(lead.model_id, [{ role: 'user', content: planPrompt }])
+
+  const planTrace = {
+    agentName: lead.name,
+    agentId: lead.id,
+    role: lead.role,
+    modelId: lead.model_id,
+    output: plan,
+    processingTime: Date.now() - planStartTime,
+    stepIndex: 0,
+    status: 'completed',
+  }
+  traces.push(planTrace)
+  onTraceUpdate({ ...planTrace })
+
+  const subOutputs = await Promise.all(
+    subordinates.map(async (agent, i) => {
+      const startTime = Date.now()
+      onTraceUpdate({
+        agentName: agent.name,
+        role: agent.role,
+        modelId: agent.model_id,
+        status: 'running',
+        stepIndex: i + 1,
+      })
+
+      const subPrompt = `${agent.system_prompt}\n\n${memoryContext ?? ''}\n\nLead agent plan:\n${plan}\n\nContext:\n${context}\n\nQuestion: ${question}\n\nExecute your part as ${agent.role}:`
+
+      try {
+        const { output, modelUsed } = await runAgentWithRouting(agent, subPrompt, question)
+        const trace = {
+          agentName: agent.name,
+          agentId: agent.id,
+          role: agent.role,
+          modelId: modelUsed,
+          output,
+          processingTime: Date.now() - startTime,
+          stepIndex: i + 1,
+          status: 'completed',
+        }
+        onTraceUpdate({ ...trace })
+        return trace
+      } catch (error) {
+        return {
+          agentName: agent.name,
+          agentId: agent.id,
+          role: agent.role,
+          modelId: agent.model_id,
+          output: `Error: ${error.message}`,
+          processingTime: Date.now() - startTime,
+          stepIndex: i + 1,
+          status: 'failed',
+        }
+      }
+    })
+  )
+
+  traces.push(...subOutputs)
+  return traces
+}
+
+export async function runMultiAgentPipeline({
+  question,
+  agents,
+  knowledgeBaseId,
+  teamId,
+  userId,
+  collaborationMode = 'sequential',
+  debateConfig = {},
+  memoryEnabled = false,
+  ragOptions = {},
+  onTraceUpdate = () => {},
+}) {
+  const startTime = Date.now()
+
+  // 1. Retrieve RAG chunks
+  let chunks = []
+  let context = 'No knowledge base connected. Answer from your general knowledge.'
+  let retrievalMethod = 'none'
+  let retrievalRewrites = []
+
+  if (knowledgeBaseId) {
+    try {
+      const retrievalResult = await retrieveWithFallback({
+        query: question,
+        knowledgeBaseId,
+        userId,
+        topK: ragOptions?.topK ?? 5,
+        threshold: ragOptions?.threshold ?? 0.3,
+        options: {
+          useLLMRerank: ragOptions?.useLLMRerank ?? false,
+          vectorWeight: ragOptions?.vectorWeight ?? 0.7,
+          keywordWeight: ragOptions?.keywordWeight ?? 0.3,
+        },
+      })
+
+      chunks = retrievalResult.chunks
+      retrievalMethod = retrievalResult.method
+      retrievalRewrites = retrievalResult.rewrites ?? []
+
+      const formatted = formatRetrievalResult(retrievalResult)
+
+      if (formatted.isEmpty) {
+      // Graceful empty — agents will know there's no context
+        context = formatted.message
+      } else {
+        context = formatted.context
+      }
+
+      console.log(`[Orchestrator] Retrieval method: ${retrievalMethod}, chunks: ${chunks.length}`)
+    } catch (error) {
+      console.error('Retrieval pipeline error:', error)
+      context = `Knowledge base retrieval encountered an error: ${error.message}\n\nPlease try rephrasing your question.`
+    }
+  }
+
+  // 2. Load shared memory if enabled
+  let memoryContext = null
+  if (memoryEnabled && teamId && userId) {
+    const memories = await getTeamMemories(teamId, userId, 8)
+    memoryContext = formatMemoriesAsContext(memories)
+  }
+
+  // 3. Sort agents
+  const sortedAgents = [...agents].sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0))
+
+  // 4. Run agents
+  let agentTraces = []
+
+  // In the collaboration mode routing section:
+  if (collaborationMode === 'debate') {
+    agentTraces = await runDebate(sortedAgents, question, context, memoryContext, debateConfig, onTraceUpdate)
+  } else if (collaborationMode === 'hierarchical') {
+    agentTraces = await runHierarchical(sortedAgents, question, context, memoryContext, onTraceUpdate)
+  } else if (collaborationMode === 'parallel') {
+    agentTraces = await runParallel(sortedAgents, question, context, memoryContext, onTraceUpdate)
+  } else {
+    agentTraces = await runSequential(sortedAgents, question, context, memoryContext, onTraceUpdate)
+  }
+
+  // 5. Synthesize
+  const completedTraces = agentTraces.filter(t => t.status === 'completed')
+  let finalAnswer = ''
+
+  if (completedTraces.length === 0) {
+    finalAnswer = 'All agents failed to process the query.'
+  } else if (completedTraces.length === 1) {
+    finalAnswer = completedTraces[0].output
+  } else {
+    onTraceUpdate({
+      agentName: 'Synthesizer',
+      role: 'synthesizer',
+      modelId: sortedAgents[sortedAgents.length - 1].model_id,
+      status: 'running',
+      stepIndex: agentTraces.length,
+      isSynthesis: true,
+    })
+
+    const synthesisPrompt = buildSynthesisPrompt(question, completedTraces, context, memoryContext)
+    const lastModel = sortedAgents[sortedAgents.length - 1].model_id
+
+    finalAnswer = await ollamaChat(lastModel, [
+      { role: 'user', content: synthesisPrompt }
+    ])
+
+    onTraceUpdate({
+      agentName: 'Synthesizer',
+      role: 'synthesizer',
+      modelId: lastModel,
+      status: 'completed',
+      stepIndex: agentTraces.length,
+      output: finalAnswer,
+      isSynthesis: true,
+    })
+  }
+
+  // 6. Score
+  const firstModel = sortedAgents[0]?.model_id ?? 'llama3:latest'
+  const scores = await scoreAnswer(question, finalAnswer, context, firstModel)
+
+  return {
+    finalAnswer,
+    agentTraces,
+    chunks,
+    scores,
+    processingTime: Date.now() - startTime,
+    memoryUsed: !!memoryContext,
+    retrievalMethod,        
+    retrievalRewrites,      
+    retrievalEmpty: chunks.length === 0,
+  }
+}
